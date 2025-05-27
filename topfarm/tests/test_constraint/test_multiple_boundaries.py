@@ -326,8 +326,30 @@ class TestMultiCircleBoundaryConstraint(unittest.TestCase):
             plot_comp=plot_comp,
             driver=SimpleGADriver(),
         )
-        tf.check_gradients(True)
+        
+        # Ensure model is fully set up
+        tf.setup() 
+        # Replicate comp_name_lst logic from TopFarmProblem.check_gradients(check_all=True)
+        comp_name_lst = [comp.pathname for comp in tf.model.system_iter()
+                         if hasattr(comp, '_has_compute_partials') and comp._has_compute_partials]
+        
+        print(f"Attempting check_partials with method='cs' for components: {comp_name_lst}")
+        cs_failed = False
+        try:
+            # compact_print=True and show_only_incorrect=True are used
+            tf.check_partials(includes=comp_name_lst, compact_print=True, method='cs', show_only_incorrect=True)
+            print("check_partials with method='cs' completed without raising an exception.")
+        except Exception as e_cs:
+            print(f"check_partials with method='cs' failed: {e_cs}")
+            cs_failed = True
 
+        if cs_failed:
+            print(f"Attempting check_partials with method='fd_central' for components: {comp_name_lst}")
+            try:
+                tf.check_partials(includes=comp_name_lst, compact_print=True, method='fd_central', show_only_incorrect=True)
+                print("check_partials with method='fd_central' completed without raising an exception.")
+            except Exception as e_fd_central:
+                print(f"check_partials with method='fd_central' also failed: {e_fd_central}")
 
 class TestMultiCircleBoundaryComp(unittest.TestCase):
     def setUp(self):

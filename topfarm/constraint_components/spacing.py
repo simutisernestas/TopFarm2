@@ -180,8 +180,8 @@ class SpacingComp(ConstraintComponent):
         # upper triangle -> 1 row per WT pair [(0,1), (0,2),..(n-1,n)]
         dx, dy = dX[np.triu_indices(n_wt, 1)], dY[np.triu_indices(n_wt, 1)]
 
-        dSdx = np.array([-2 * dx, 2 * dx]).T
-        dSdy = np.array([-2 * dy, 2 * dy]).T
+        dSdx = np.array([2 * dx, -2 * dx]).T
+        dSdy = np.array([2 * dy, -2 * dy]).T
         return dSdx, dSdy
 
     def plot(self, ax=None):
