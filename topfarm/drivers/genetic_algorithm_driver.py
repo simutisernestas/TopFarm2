@@ -34,7 +34,7 @@ except ModuleNotFoundError:
 
 import openmdao
 from openmdao.core.driver import Driver, RecordingDebugging
-from openmdao.utils.concurrent import concurrent_eval
+from openmdao.utils.concurrent_utils import concurrent_eval
 from openmdao.utils.mpi import MPI
 from openmdao.core.analysis_error import AnalysisError
 

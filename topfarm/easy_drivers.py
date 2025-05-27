@@ -199,8 +199,8 @@ try:
     from pyoptsparse.pyIPOPT.pyIPOPT import pyipoptcore
     if pyipoptcore is None:
         setattr(sys.modules[__name__], 'EasyPyOptSparseIPOPT', PyOptSparseMissingDriver)
-except (ModuleNotFoundError, Exception) as e:
-    for n in ["EasyPyOptSparseSNOPT"]:
+except ImportError as e:
+    for n in ["EasyPyOptSparseIPOPT"]: # Corrected: only EasyPyOptSparseIPOPT is defined in this block
         setattr(sys.modules[__name__], n, PyOptSparseMissingDriver)
 
 
@@ -238,7 +238,7 @@ try:
                 l, u = desvar_values[1], desvar_values[2]
                 kwargs = {'ref0': ref0, 'ref': ref1, 'lower': l, 'upper': u}
             return kwargs
-except (ModuleNotFoundError, Exception) as e:
+except ImportError as e:
     for n in ["EasyPyOptSparseSNOPT"]:
         setattr(sys.modules[__name__], n, PyOptSparseMissingDriver)
 
