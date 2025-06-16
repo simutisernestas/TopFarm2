@@ -16,7 +16,7 @@ from matplotlib.pyplot import Circle
 
 class XYBoundaryConstraint(Constraint):
 
-    def __init__(self, boundary, boundary_type='convex_hull', units=None, relaxation=False, **kwargs):
+    def __init__(self, boundary, boundary_type='convex_hull', units=None, relaxation=False, turbine_diameter=None, **kwargs):
         """Initialize XYBoundaryConstraint
 
         Parameters
@@ -33,35 +33,74 @@ class XYBoundaryConstraint(Constraint):
             - 'square': Smallest axis-aligned square covering the boundary points
             - 'multi_polygon': Mulitple polygon boundaries incl. exclusion zones (may be non convex).\n
             - 'turbine_specific': Set of multiple polygon boundaries that depend on the wind turbine type. \n
-
+        turbine_diameter : float, optional
+            Turbine diameter, used for scaling the boundary coordinates.
+            If None, no scaling is applied. Default is None.
 
         """
+        self.turbine_diameter = turbine_diameter
         if boundary_type == 'multi_polygon':
-            self.zones = boundary
-            self.boundary = np.asarray(self.zones[0].boundary)
+            self.zones_original = boundary # Keep original zones if needed for other logic
+            self.zones = []
+            for z_orig in boundary: # Assuming boundary is a list of Zone objects
+                scaled_b = np.asarray(z_orig.boundary)
+                if self.turbine_diameter is not None and self.turbine_diameter > 0:
+                    scaled_b = scaled_b / self.turbine_diameter
+
+                if isinstance(z_orig, InclusionZone):
+                    new_zone = InclusionZone(scaled_b, z_orig.dist2wt, z_orig.geometry_type, z_orig.name)
+                elif isinstance(z_orig, ExclusionZone):
+                    new_zone = ExclusionZone(scaled_b, z_orig.dist2wt, z_orig.geometry_type, z_orig.name)
+                else:
+                    warnings.warn(f"Scaling for zone type {type(z_orig)} not fully implemented for multi_polygon. Boundary scaled, other attributes preserved.")
+                    new_zone = Zone(scaled_b, z_orig.dist2wt, z_orig.geometry_type, z_orig.incl, z_orig.name)
+                self.zones.append(new_zone)
+            self.boundary = np.asarray(self.zones[0].boundary) if self.zones else np.array([])
+
         elif boundary_type == 'turbine_specific':
-            self.zones = boundary
+            self.zones_original = boundary
+            self.zones = []
+            for z_orig in boundary:
+                scaled_b = np.asarray(z_orig.boundary)
+                if self.turbine_diameter is not None and self.turbine_diameter > 0:
+                    scaled_b = scaled_b / self.turbine_diameter
+
+                if isinstance(z_orig, InclusionZone):
+                    new_zone = InclusionZone(scaled_b, z_orig.dist2wt, z_orig.geometry_type, z_orig.name)
+                elif isinstance(z_orig, ExclusionZone):
+                    new_zone = ExclusionZone(scaled_b, z_orig.dist2wt, z_orig.geometry_type, z_orig.name)
+                else:
+                    warnings.warn(f"Scaling for zone type {type(z_orig)} not fully implemented for turbine_specific. Boundary scaled, other attributes preserved.")
+                    new_zone = Zone(scaled_b, z_orig.dist2wt, z_orig.geometry_type, z_orig.incl, z_orig.name)
+                self.zones.append(new_zone)
+            self.boundary = np.asarray(self.zones[0].boundary) if self.zones else np.array([])
             assert 'turbines' in list(kwargs)
             self.turbines = kwargs['turbines']
-            self.boundary = np.asarray(self.zones[0].boundary)
         else:
             self.boundary = np.asarray(boundary)
+            if self.turbine_diameter is not None and self.turbine_diameter > 0:
+                self.boundary = self.boundary / self.turbine_diameter
+
         self.boundary_type = boundary_type
         self.const_id = 'xyboundary_comp_{}'.format(boundary_type)
         self.units = units
         self.relaxation = relaxation
 
-    def get_comp(self, n_wt):
-        if not hasattr(self, 'boundary_comp'):
+    def get_comp(self, n_wt, turbine_diameter_to_use=None): # Added turbine_diameter_to_use
+        # If turbine_diameter_to_use is provided, it takes precedence. Otherwise, use self.turbine_diameter (from __init__).
+        td = turbine_diameter_to_use if turbine_diameter_to_use is not None else self.turbine_diameter
+
+        if not hasattr(self, 'boundary_comp') or (turbine_diameter_to_use is not None and td != self.boundary_comp.turbine_diameter):
+            # Re-initialize if component does not exist or if a new turbine_diameter is provided that differs
             if self.boundary_type == 'polygon':
                 self.boundary_comp = PolygonBoundaryComp(
-                    n_wt, self.boundary, self.const_id, self.units, self.relaxation)
+                    n_wt, self.boundary, self.const_id, self.units, self.relaxation, turbine_diameter=td)
             elif self.boundary_type == 'multi_polygon':
-                self.boundary_comp = MultiPolygonBoundaryComp(n_wt, self.zones, const_id=self.const_id, units=self.units, relaxation=self.relaxation)
+                self.boundary_comp = MultiPolygonBoundaryComp(n_wt, self.zones, const_id=self.const_id, units=self.units, relaxation=self.relaxation, turbine_diameter=td)
             elif self.boundary_type == 'turbine_specific':
-                self.boundary_comp = TurbineSpecificBoundaryComp(n_wt, self.turbines, self.zones, const_id=self.const_id, units=self.units, relaxation=self.relaxation)
-            else:
-                self.boundary_comp = ConvexBoundaryComp(n_wt, self.boundary, self.boundary_type, self.const_id, self.units)
+                self.boundary_comp = TurbineSpecificBoundaryComp(n_wt, self.turbines, self.zones, const_id=self.const_id, units=self.units, relaxation=self.relaxation, turbine_diameter=td)
+            else: # convex_hull, rectangle, square
+                self.boundary_comp = ConvexBoundaryComp(n_wt, self.boundary, self.boundary_type, self.const_id, self.units, turbine_diameter=td)
         return self.boundary_comp
 
     @property
@@ -86,29 +125,49 @@ class XYBoundaryConstraint(Constraint):
                 else:
                     design_vars[k] = (design_vars[k][0], l, u, design_vars[k][-1])
 
-    def _setup(self, problem, group='constraint_group'):
+    def _setup(self, problem, group='constraint_group', **kwargs):
         n_wt = problem.n_wt
-        self.boundary_comp = self.get_comp(n_wt)
+        # Get turbine_diameter from kwargs if provided by TopFarmProblem
+        td_from_problem = kwargs.get('turbine_diameter')
+
+        # Pass the turbine_diameter to get_comp.
+        # self.turbine_diameter (from __init__) is used if td_from_problem is None by get_comp's logic.
+        self.boundary_comp = self.get_comp(n_wt, turbine_diameter_to_use=td_from_problem)
         self.boundary_comp.problem = problem
         self.set_design_var_limits(problem.design_vars)
-        # problem.xy_boundary = np.r_[self.boundary_comp.xy_boundary, self.boundary_comp.xy_boundary[:1]]
-        problem.indeps.add_output('xy_boundary', self.boundary_comp.xy_boundary)
-        getattr(problem.model, group).add_subsystem('xy_bound_comp', self.boundary_comp, promotes=['*'])
 
-    def setup_as_constraint(self, problem, group='constraint_group'):
-        self._setup(problem, group=group)
-        if problem.n_wt == 1:
+        # Ensure xy_boundary exists and is not empty before adding to indeps
+        if hasattr(self.boundary_comp, 'xy_boundary') and self.boundary_comp.xy_boundary is not None and self.boundary_comp.xy_boundary.size > 0:
+            problem.indeps.add_output('xy_boundary', self.boundary_comp.xy_boundary)
+        else:
+            # Fallback or warning if no boundary to output, common for circle if not explicitly made polygonal by comp
+            if self.boundary_type == 'circle': # CircleBoundaryComp might not set a plottable xy_boundary in its base comp
+                 if hasattr(self.boundary_comp,'center') and hasattr(self.boundary_comp,'radius'): # CircleBoundaryComp specific
+                      t = np.linspace(0,2*np.pi, 100)
+                      auto_circle_boundary = self.boundary_comp.center + \
+                                             np.array([np.cos(t), np.sin(t)]).T * self.boundary_comp.radius
+                      if auto_circle_boundary.size > 0 :
+                           problem.indeps.add_output('xy_boundary', auto_circle_boundary, shape_by_conn=True, desc="Auto-generated boundary for circle plotting")
+            else:
+                 warnings.warn(f"XYBoundaryConstraint ({self.const_id}): xy_boundary is None or empty, not adding to indeps.")
+
+        getattr(problem.model, group).add_subsystem(self.const_id, self.boundary_comp, promotes=['*'])
+
+
+    def setup_as_constraint(self, problem, group='constraint_group', **kwargs): # Added **kwargs
+        self._setup(problem, group=group, **kwargs) # Pass **kwargs
+        if problem.n_wt == 1 and not isinstance(self.boundary_comp, MultiConvexBoundaryComp): # MultiConvex has per-edge constraints
             lower = 0
         else:
             lower = self.boundary_comp.zeros
         problem.model.add_constraint('boundaryDistances', lower=lower)
 
-    def setup_as_penalty(self, problem, group='constraint_group'):
-        self._setup(problem, group=group)
+    def setup_as_penalty(self, problem, group='constraint_group', **kwargs): # Added **kwargs
+        self._setup(problem, group=group, **kwargs) # Pass **kwargs
 
 
 class CircleBoundaryConstraint(XYBoundaryConstraint):
-    def __init__(self, center, radius):
+    def __init__(self, center, radius, turbine_diameter=None):
         """Initialize CircleBoundaryConstraint
 
         Parameters
@@ -117,16 +176,51 @@ class CircleBoundaryConstraint(XYBoundaryConstraint):
             center position (x,y)
         radius : int or float
             circle radius
+        turbine_diameter : float, optional
+            Turbine diameter for scaling. Default is None.
         """
+        self.turbine_diameter = turbine_diameter # Store it
+        self.center_original = np.array(center)
+        self.radius_original = radius
 
-        self.center = np.array(center)
-        self.radius = radius
-        self.const_id = 'circle_boundary_comp_{}_{}'.format(
-            '_'.join([str(int(c)) for c in center]), int(radius)).replace('.', '_')
+        if self.turbine_diameter is not None and self.turbine_diameter > 0:
+            self.center = self.center_original / self.turbine_diameter
+            self.radius = self.radius_original / self.turbine_diameter
+        else:
+            self.center = self.center_original
+            self.radius = self.radius_original
 
-    def get_comp(self, n_wt):
-        if not hasattr(self, 'boundary_comp'):
-            self.boundary_comp = CircleBoundaryComp(n_wt, self.center, self.radius, self.const_id)
+        # Essential attributes for XYBoundaryConstraint compatibility if its methods are called (e.g. _setup)
+        # However, CircleBoundaryConstraint overrides get_comp and set_design_var_limits.
+        # We still need const_id for the component.
+        # No direct call to XYBoundaryConstraint.__init__ to avoid its boundary processing logic.
+        self.boundary_type = 'circle' # Implicit
+        self.units = None # Or inherit if XYBoundaryConstraint had it passed via kwargs
+        self.relaxation = False # Or inherit
+
+        # Create a const_id using potentially scaled center and radius for uniqueness if desired,
+        # but ensure it's a valid OpenMDAO component name (no dots, etc.).
+        # Using original values might be more stable if scaling is dynamic.
+        # For now, use scaled, but ensure clean names.
+        center_str = '_'.join([f"{c:.2f}".replace('.', 'p') for c in self.center])
+        radius_str = f"{self.radius:.2f}".replace('.', 'p')
+        self.const_id = f'circle_boundary_comp_{center_str}_{radius_str}'
+        # Further clean if still needed: self.const_id = self.const_id.replace('-', 'm')
+
+
+    def get_comp(self, n_wt, turbine_diameter_to_use=None): # Added turbine_diameter_to_use
+        # If turbine_diameter_to_use is provided, it implies a potential change or override.
+        # CircleBoundaryConstraint's __init__ already scales self.center and self.radius based on self.turbine_diameter.
+        # If turbine_diameter_to_use is different, we might need to re-scale or re-initialize.
+        # For now, assume self.center and self.radius are correctly scaled based on self.turbine_diameter (from __init__).
+        # The turbine_diameter_to_use is passed for consistency to the component.
+
+        td = turbine_diameter_to_use if turbine_diameter_to_use is not None else self.turbine_diameter
+
+        # Re-initialize if component doesn't exist or if turbine_diameter context changes.
+        if not hasattr(self, 'boundary_comp') or (turbine_diameter_to_use is not None and td != self.boundary_comp.turbine_diameter):
+            # Pass the (already scaled by __init__) center and radius.
+            self.boundary_comp = CircleBoundaryComp(n_wt, self.center, self.radius, self.const_id, units=self.units, turbine_diameter=td)
         return self.boundary_comp
 
     def set_design_var_limits(self, design_vars):
@@ -141,14 +235,17 @@ class CircleBoundaryConstraint(XYBoundaryConstraint):
 
 
 class BoundaryBaseComp(ConstraintComponent):
-    def __init__(self, n_wt, xy_boundary=None, const_id=None, units=None, relaxation=False, **kwargs):
+    def __init__(self, n_wt, xy_boundary=None, const_id=None, units=None, relaxation=False, turbine_diameter=None, **kwargs):
         super().__init__(**kwargs)
         self.n_wt = n_wt
+        self.turbine_diameter = turbine_diameter # Store for potential use or consistency
         self.xy_boundary = np.array(xy_boundary)
+        # Scaling of xy_boundary is assumed to be done by the calling Constraint class (e.g. XYBoundaryConstraint)
+        # before this component is initialized.
         self.const_id = const_id
         self.units = units
         self.relaxation = relaxation
-        if xy_boundary is not None and np.any(self.xy_boundary[0] != self.xy_boundary[-1]):
+        if xy_boundary is not None and self.xy_boundary.size > 0 and np.any(self.xy_boundary[0] != self.xy_boundary[-1]):
             self.xy_boundary = np.r_[self.xy_boundary, self.xy_boundary[:1]]
 
     def setup(self):
@@ -202,11 +299,13 @@ class BoundaryBaseComp(ConstraintComponent):
 
 
 class ConvexBoundaryComp(BoundaryBaseComp):
-    def __init__(self, n_wt, xy_boundary=None, boundary_type='convex_hull', const_id=None, units=None):
+    def __init__(self, n_wt, xy_boundary=None, boundary_type='convex_hull', const_id=None, units=None, turbine_diameter=None):
         self.boundary_type = boundary_type
-        self.calculate_boundary_and_normals(xy_boundary)
-        super().__init__(n_wt, self.xy_boundary, const_id, units)
-        self.calculate_gradients()
+        # xy_boundary is assumed to be already scaled if turbine_diameter was provided to XYBoundaryConstraint.
+        # No further scaling needed here based on turbine_diameter argument itself.
+        self.calculate_boundary_and_normals(xy_boundary) # operates on (potentially scaled) xy_boundary
+        super().__init__(n_wt, self.xy_boundary, const_id, units, relaxation=False, turbine_diameter=turbine_diameter) # Added relaxation=False for consistency if not passed by XYBC for this comp type
+        self.calculate_gradients() # operates on self.xy_boundary and self.unit_normals (derived from scaled)
         self.zeros = np.zeros([self.n_wt, self.nVertices])
 
     def calculate_boundary_and_normals(self, xy_boundary):
@@ -339,18 +438,27 @@ class ConvexBoundaryComp(BoundaryBaseComp):
 
 
 class PolygonBoundaryComp(BoundaryBaseComp):
-    def __init__(self, n_wt, xy_boundary, const_id=None, units=None, relaxation=False):
+    def __init__(self, n_wt, xy_boundary, const_id=None, units=None, relaxation=False, turbine_diameter=None):
 
-        self.nTurbines = n_wt
-        self.const_id = const_id
-        self.zeros = np.zeros(self.nTurbines)
-        self.units = units
-        self.boundary_properties = self.get_boundary_properties(xy_boundary)
-        BoundaryBaseComp.__init__(self, n_wt, xy_boundary=self.boundary_properties[0], const_id=const_id,
-                                  units=units, relaxation=relaxation)
+        self.nTurbines = n_wt # Used by some methods, equivalent to n_wt
+        # self.const_id = const_id # Set by super
+        # self.units = units # Set by super
+        # self.turbine_diameter = turbine_diameter # Set by super
+
+        # xy_boundary is assumed to be already scaled if turbine_diameter was provided to XYBoundaryConstraint.
+        # No further scaling based on turbine_diameter argument here.
+        # get_boundary_properties operates on this (potentially scaled) xy_boundary.
+        self.boundary_properties = self.get_boundary_properties(xy_boundary if xy_boundary is not None and xy_boundary.size > 0 else np.array([[0,0],[0,1],[1,0]])) # Pass dummy for safety if empty
+
+        # BoundaryBaseComp.__init__ expects the main xy_boundary for plotting, etc.
+        # self.boundary_properties[0] is the processed vertex list (e.g., closed loop).
+        super().__init__(n_wt, xy_boundary=self.boundary_properties[0], const_id=const_id,
+                                  units=units, relaxation=relaxation, turbine_diameter=turbine_diameter)
+
+        self.zeros = np.zeros(self.nTurbines) # Distances are per-turbine for simple polygon
         self._cache_input = None
         self._cache_output = None
-        self.relaxation = relaxation
+        # self.relaxation = relaxation # Set by super
 
     def get_boundary_properties(self, xy_boundary, inclusion_zone=True):
         vertices = np.array(xy_boundary)
@@ -498,13 +606,28 @@ class PolygonBoundaryComp(BoundaryBaseComp):
 
 
 class CircleBoundaryComp(PolygonBoundaryComp):
-    def __init__(self, n_wt, center, radius, const_id=None, units=None):
+    def __init__(self, n_wt, center, radius, const_id=None, units=None, turbine_diameter=None):
+        # center and radius are assumed to be already scaled by CircleBoundaryConstraint.
         self.center = center
         self.radius = radius
+        # self.turbine_diameter will be set by PolygonBoundaryComp's __init__ via super()
+
+        # Generate xy_boundary from scaled center and radius for PolygonBoundaryComp's base methods (e.g. plotting).
+        # This is used by PolygonBoundaryComp's __init__ and potentially by BoundaryBaseComp's plot method.
         t = np.linspace(0, 2 * np.pi, 100)
-        xy_boundary = self.center + np.array([np.cos(t), np.sin(t)]).T * self.radius
-        BoundaryBaseComp.__init__(self, n_wt, xy_boundary, const_id, units)
-        self.zeros = np.zeros(self.n_wt)
+        xy_boundary_for_plot = self.center + np.array([np.cos(t), np.sin(t)]).T * self.radius
+
+        # Call PolygonBoundaryComp's __init__
+        # It expects: n_wt, xy_boundary, const_id, units, relaxation, turbine_diameter
+        super().__init__(n_wt,
+                         xy_boundary=xy_boundary_for_plot,
+                         const_id=const_id,
+                         units=units,
+                         relaxation=False, # CircleBoundaryComp typically doesn't use relaxation itself
+                         turbine_diameter=turbine_diameter)
+
+        # PolygonBoundaryComp's __init__ correctly sets self.zeros = np.zeros(self.nTurbines)
+        # which is appropriate for CircleBoundaryComp as its distances are per turbine (n_wt).
 
     def plot(self, ax=None):
         ax = ax or plt.gca()
@@ -545,14 +668,15 @@ class ExclusionZone(Zone):
 
 class MultiPolygonBoundaryComp(PolygonBoundaryComp):
     def __init__(self, n_wt, zones, const_id=None, units=None, relaxation=False, method='nearest',
-                 simplify_geometry=False):
+                 simplify_geometry=False, turbine_diameter=None):
         '''
         Parameters
         ----------
         n_wt : TYPE
             DESCRIPTION.
         zones : list
-            list of InclusionZone and ExclusionZone objects
+            list of InclusionZone and ExclusionZone objects. Boundaries within zones are assumed
+            to be already scaled by XYBoundaryConstraint if turbine_diameter was provided.
         const_id : TYPE, optional
             DESCRIPTION. The default is None.
         units : TYPE, optional
@@ -562,18 +686,43 @@ class MultiPolygonBoundaryComp(PolygonBoundaryComp):
             calculates the weighted minimum distance to all edges/points. The default is 'nearest'.
         simplify : float or dict
             if float, simplification tolerance. if dict, shapely.simplify keyword arguments
+        turbine_diameter : float, optional
+            Passed to super and stored in BoundaryBaseComp. Scaling of zones' boundaries
+            is assumed to be handled by XYBoundaryConstraint.
         Returns
         -------
         None.
 
         '''
-        self.zones = zones
+        self.zones = zones # zones' boundaries are already scaled by XYBoundaryConstraint
+        # self.turbine_diameter will be set by PolygonBoundaryComp's __init__ via super()
+
+        # get_xy_boundaries uses self.zones (which have scaled boundaries).
+        # The static _zone2poly in MultiPolygonBoundaryComp is simple and does not use turbine_diameter
+        # for buffer scaling (it uses hardcoded D,H which implies physical scale, but buffers are applied to
+        # potentially scaled coordinates from z.boundary).
+        # This specific _zone2poly is static and does not interact with turbine_diameter.
         self.bounds_poly, xy_boundaries = self.get_xy_boundaries()
-        PolygonBoundaryComp.__init__(self, n_wt, xy_boundary=xy_boundaries[0], const_id=const_id, units=units, relaxation=relaxation)
-        # self.bounds_poly = [Polygon(x) for x in xy_boundaries]
+
+        initial_xy_for_super = xy_boundaries[0] if xy_boundaries and len(xy_boundaries) > 0 and xy_boundaries[0].size > 0 else np.array([[0,0],[0,1],[1,0]])
+
+
+        super().__init__(n_wt,
+                         xy_boundary=initial_xy_for_super,
+                         const_id=const_id,
+                         units=units,
+                         relaxation=relaxation,
+                         turbine_diameter=turbine_diameter)
+
         self.incl_excls = [x.incl for x in zones]
-        self._setup_boundaries(self.bounds_poly, self.incl_excls)
-        self.relaxation = relaxation
+        if self.bounds_poly and all(isinstance(p, (Polygon, MultiPolygon)) for p in self.bounds_poly) and any(p.area > 1e-3 for p in self.bounds_poly):
+             self._setup_boundaries(self.bounds_poly, self.incl_excls)
+        else:
+             self.boundaries = []
+             self.boundary_properties_list_all = [np.array([]) for _ in range(7)]
+             warnings.warn("MultiPolygonBoundaryComp: No valid boundaries were set up after processing zones.")
+
+
         self.method = method
         if simplify_geometry:
             self.simplify(simplify_geometry)
@@ -825,23 +974,41 @@ class MultiPolygonBoundaryComp(PolygonBoundaryComp):
 
 class TurbineSpecificBoundaryComp(MultiPolygonBoundaryComp):
     def __init__(self, n_wt, wind_turbines, zones, const_id=None,
-                 units=None, relaxation=False, method='nearest', simplify_geometry=False):
-        # self.dependencies = [d or {'type': None, 'multiplier': None, 'ref': None} for d in dependencies]
-        # self.multi_boundary = xy_boundaries = self.get_xy_boundaries(boundaries, geometry_types, incl_excls)
+                 units=None, relaxation=False, method='nearest', simplify_geometry=False, turbine_diameter=None):
+
         self.wind_turbines = wind_turbines
         self.types = wind_turbines.types()
-        # self.incl_excls = incl_excls
         self.n_wt = n_wt
+        # zones' base boundaries (coordinates) are assumed to be ALREADY SCALED by XYBoundaryConstraint
+        # if a global turbine_diameter was provided to it.
         self.zones = zones
+        self.turbine_diameter_global_scale = turbine_diameter # This is the global scaler, used by _zone2poly for buffers.
+
+        # get_ts_boundaries calls self._zone2poly.
+        # _zone2poly (now an instance method) uses self.turbine_diameter_global_scale
+        # to scale physical buffer distances calculated from D, H parameters.
         self.ts_polygon_boundaries, ts_xy_boundaries = self.get_ts_boundaries()
-        MultiPolygonBoundaryComp.__init__(self, n_wt=n_wt, zones=zones, const_id=const_id, units=units,
-                                          relaxation=relaxation, method=method, simplify_geometry=simplify_geometry)
-        # self.polygon_boundaries = [Polygon(x) for x, _ in xy_boundaries]
-        # self.ts_polygon_boundaries = self.get_ts_polygon_boundaries(self.types)
+
+        # Initialize MultiPolygonBoundaryComp.
+        # Pass self.zones (which have scaled coordinates from XYBoundaryConstraint).
+        # Pass the global turbine_diameter for consistency and storage in BoundaryBaseComp.
+        super().__init__(n_wt=n_wt, zones=self.zones, const_id=const_id, units=units,
+                         relaxation=relaxation, method=method, simplify_geometry=simplify_geometry,
+                         turbine_diameter=turbine_diameter)
+
+        # Post MultiPolygonBoundaryComp initialization, TurbineSpecific specifics are set up.
+        # self.ts_polygon_boundaries are now correctly scaled (base coords by XYBC, buffers by our _zone2poly).
         self.ts_merged_polygon_boundaries = self.merge_boundaries()
         self.ts_merged_xy_boundaries = self.get_ts_xy_boundaries()
-        self.ts_boundary_properties = self.get_ts_boundary_properties()
-        self.ts_item_indices = self.get_ts_item_indices()
+
+        if self.ts_merged_xy_boundaries and any(b_list for b_list in self.ts_merged_xy_boundaries if any(b for b in b_list)):
+            self.ts_boundary_properties = self.get_ts_boundary_properties()
+            self.ts_item_indices = self.get_ts_item_indices()
+        else:
+            self.ts_boundary_properties = []
+            self.ts_item_indices = []
+            warnings.warn("TurbineSpecificBoundaryComp resulted in no effective boundaries for one or more turbine types.")
+
 
     def get_ts_boundaries(self):
         polygons = []
@@ -1014,14 +1181,35 @@ class TurbineSpecificBoundaryComp(MultiPolygonBoundaryComp):
 
 class MultiCircleBoundaryComp(PolygonBoundaryComp):
 
-    def __init__(self, n_wt, geometry, wt_groups, const_id=None, units=None):
-        self.__validate_input(geometry, wt_groups)
-        self.center = [g[0] for g in geometry]
-        self.radius = [g[1] for g in geometry]
-        # ones where the indices in each wt_group are active, zeros elsewhere
+    def __init__(self, n_wt, geometry, wt_groups, const_id=None, units=None, turbine_diameter=None):
+        self.__validate_input(geometry, wt_groups) # Validates original geometry structure
+        # self.turbine_diameter will be set by super() via PolygonBoundaryComp -> BoundaryBaseComp
+
+        self.center_original = [np.array(g[0]) for g in geometry]
+        self.radius_original = [g[1] for g in geometry]
+
+        if turbine_diameter is not None and turbine_diameter > 0:
+            self.center = [c_orig / turbine_diameter for c_orig in self.center_original]
+            self.radius = [r_orig / turbine_diameter for r_orig in self.radius_original]
+        else:
+            self.center = self.center_original
+            self.radius = self.radius_original
+
         self.masks = [np.isin(np.arange(n_wt), g) for g in wt_groups]
-        BoundaryBaseComp.__init__(self, n_wt, None, const_id, units)
-        self.zeros = np.zeros(self.n_wt)
+
+        representative_xy_boundary = None
+        if self.center: # Create a representative boundary for plotting by base class
+            t_plot = np.linspace(0, 2 * np.pi, 30)
+            representative_xy_boundary = self.center[0] + np.array([np.cos(t_plot), np.sin(t_plot)]).T * self.radius[0]
+
+        # Call PolygonBoundaryComp's __init__
+        super().__init__(n_wt,
+                         xy_boundary=representative_xy_boundary,
+                         const_id=const_id,
+                         units=units,
+                         relaxation=False,
+                         turbine_diameter=turbine_diameter)
+        # PolygonBoundaryComp's __init__ sets self.zeros, which is fine for MultiCircle.
 
     def __validate_input(self, geometry, wt_groups):
         does_len_match = len(geometry) == len(wt_groups)
@@ -1130,18 +1318,34 @@ class MultiConvexBoundaryComp(BoundaryBaseComp):
     def __init__(
         self,
         n_wt,
-        geometry,
+        geometry, # Assumed to be unscaled (original physical coordinates) when passed here
         wt_groups,
         const_id=None,
         units=None,
+        turbine_diameter=None, # Added for scaling
     ):
+        # self.turbine_diameter will be set by super()
+
+        scaled_geometry = geometry
+        if turbine_diameter is not None and turbine_diameter > 0:
+            scaled_geometry = []
+            for g_coords in geometry: # g_coords is a numpy array of vertices
+                scaled_g_coords = np.asarray(g_coords) / turbine_diameter
+                scaled_geometry.append(scaled_g_coords)
+
+        # Create Boundary objects with potentially scaled geometry
         xy_boundaries = [
-            Boundary(g, np.isin(np.arange(n_wt), mask))
-            for g, mask in zip(geometry, wt_groups)
+            Boundary(sg, np.isin(np.arange(n_wt), mask)) # sg is scaled geometry
+            for sg, mask in zip(scaled_geometry, wt_groups)
         ]
+
         self.xy_boundaries = self.sort_boundaries(xy_boundaries)
+        # calculate_boundary_and_normals also operates on the (potentially scaled) vertices within Boundary objects
         self.xy_boundaries = self.calculate_boundary_and_normals(self.xy_boundaries)
-        super().__init__(n_wt, None, const_id, units)
+
+        # Call BoundaryBaseComp's __init__
+        super().__init__(n_wt, None, const_id, units, relaxation=False, turbine_diameter=turbine_diameter)
+
         self.turbine_vertice_prod = 0
         total_n_active_turbines = 0
         for b in self.xy_boundaries:
@@ -1285,34 +1489,48 @@ class MultiWFPolygonBoundaryComp(PolygonBoundaryComp):
     def __init__(
         self,
         n_wt: int,
-        geometry,
+        geometry, # Assumed to be unscaled (original physical coordinates)
         wt_groups,
+        # **kwargs may include const_id, units, relaxation, and now turbine_diameter
         **kwargs,
     ):
-        boundaries = {i: geom for i, geom in enumerate(geometry)}
-        turbine_groups = {i: group for i, group in enumerate(wt_groups)}
+        turbine_diameter_from_kwargs = kwargs.get('turbine_diameter')
+        # self.turbine_diameter will be set by super() via PolygonBoundaryComp -> BoundaryBaseComp
 
-        self.boundaries = {}  # group_id: boundary_coords
-        for group_id, boundary_coords in boundaries.items():
-            boundary_coords = self.__validate_boundary_coords(boundary_coords)
-            # close the boundary if needed
-            if not np.all(boundary_coords[0] == boundary_coords[-1]):
-                boundary_coords = np.vstack([boundary_coords, boundary_coords[0]])
-            self.boundaries[group_id] = boundary_coords
+        raw_boundaries_map = {i: geom for i, geom in enumerate(geometry)}
+        turbine_groups_map = {i: group for i, group in enumerate(wt_groups)}
 
-        self.__validate_group_assignments(turbine_groups, n_wt)
-        self.turbine_groups = {i: -1 for i in range(n_wt)}  # turbine_idx: group_id
-        for group_id, indices in turbine_groups.items():
-            if group_id not in self.boundaries:
+        self.boundaries = {}  # group_id: potentially scaled boundary_coords
+        for group_id, original_boundary_coords in raw_boundaries_map.items():
+            # Validate original coordinates structure first
+            processed_coords = self.__validate_boundary_coords(original_boundary_coords)
+
+            if turbine_diameter_from_kwargs is not None and turbine_diameter_from_kwargs > 0:
+                processed_coords = processed_coords / turbine_diameter_from_kwargs
+
+            # Close the boundary if needed
+            if not np.all(processed_coords[0] == processed_coords[-1]):
+                processed_coords = np.vstack([processed_coords, processed_coords[0]])
+            self.boundaries[group_id] = processed_coords
+
+        self.__validate_group_assignments(turbine_groups_map, n_wt)
+        self.turbine_groups = {i: -1 for i in range(n_wt)}
+        for group_id, indices in turbine_groups_map.items():
+            if group_id not in self.boundaries: # Should not happen if geometry and wt_groups have same keys
                 raise ValueError(f"No boundary defined for group {group_id}")
             for idx in indices:
                 self.turbine_groups[idx] = group_id
-        # check that all turbines are assigned to a group
-        if -1 in self.turbine_groups.values():
-            raise ValueError(f"All turbines must be assigned to a group; All the -1 should be filled\n{self.turbine_groups}")
+        if -1 in self.turbine_groups.values(): # Ensure all turbines covered
+            unassigned_turbines = [idx for idx, grp_id in self.turbine_groups.items() if grp_id == -1]
+            raise ValueError(f"All turbines must be assigned to a group. Unassigned turbines: {unassigned_turbines}")
 
+        # For PolygonBoundaryComp's __init__, provide one of the (scaled) boundaries.
+        initial_boundary_for_super = np.array(list(self.boundaries.values())[0]).reshape(-1, 2) if self.boundaries else np.array([[0,0],[0,1],[1,0]]) # Dummy if no boundaries
+
+        # Pass all relevant kwargs (const_id, units, relaxation, turbine_diameter) to PolygonBoundaryComp's init
         super().__init__(
-            n_wt, np.array(list(boundaries.values())[0]).reshape(-1, 2), **kwargs
+            n_wt, initial_boundary_for_super,
+            **kwargs # This will pass const_id, units, relaxation, turbine_diameter
         )
 
     def __validate_boundary_coords(self, boundary_coords: np.ndarray) -> None:
@@ -1417,43 +1635,52 @@ class BoundaryType(Enum):
 
 class MultiWFBoundaryConstraint(XYBoundaryConstraint):
 
-    def __init__(self, geometry, wt_groups, boundtype, units=None):
+    def __init__(self, geometry, wt_groups, boundtype, units=None, turbine_diameter=None):
         """Entry point for creating boundary constraints for joint multi-wind-farm optimization.
 
         Parameters
         ----------
         geometry : Iterable
-            Geometry input depends on a specific boundary type:
-
-            CIRCLE - it is a list of tuples [(center1, radius1), (center2, radius2), ...],
-            where center itself is a tuple (x, y) and radius is a scalar.
-
-            CONVEX_HULL - it is a list of numpy arrays, where each array represents a convex hull boundary.
-            Each array has shape (n, 2) where n is the number of vertices.
-
-            POLYGON - it is a list of numpy arrays, where each array represents a polygon boundary.
-            Each array has shape (n, 2) where n is the number of vertices.
-
-            !!! Input length must match the number of groups in wt_groups. !!!
-
+            Geometry input (e.g., list of coords, list of (center, radius)) for the boundaries.
+            These are assumed to be in original, unscaled units.
         wt_groups : Iterable
-            List of lists where each list contains indices of turbines assigned to a specific boundary.
-            For instance, [[0, 1], [2, 3, 4], ...] assigns turbines 0 and 1 to boundary 0, and turbines 2, 3, and 4 to boundary 1.
-
-            !!! Input length must match the number of geometries in geometry parameter. !!!
-
+            List of lists defining turbine indices for each geometry.
         boundtype : BoundaryType
-            One of BoundaryType.CIRCLE, BoundaryType.CONVEX_HULL, BoundaryType.POLYGON.
-            The argument specifies the type of boundary constraint to be enforced.
-
+            Specifies the type of boundary constraint.
         units : str, optional
-            Units for the boundary, by default None
+            Units for the boundary. Default is None.
+        turbine_diameter : float, optional
+            Turbine diameter used for scaling. If provided, geometry processed by
+            components will be in terms of diameters. Default is None.
         """
-        self.geometry = geometry
-        self.boundtype = boundtype
-        self.const_id = f"wf_boundary_comp_{id(self)}"
-        self.units = units
+        # Note: We don't call super().__init__ of XYBoundaryConstraint because its logic
+        # for handling 'boundary' and 'boundary_type' is different from MultiWF.
+        # We set necessary attributes directly or rely on component initializers.
+        self.geometry = geometry # Store original, unscaled geometry
         self.wt_groups = wt_groups
+        self.boundtype = boundtype
+        self.units = units
+        self.turbine_diameter = turbine_diameter # Store for passing to components and for internal scaling logic
+
+        # Create a somewhat more deterministic const_id
+        geom_repr_list = []
+        if self.geometry:
+            first_geom_item = self.geometry[0]
+            if isinstance(first_geom_item, (list, np.ndarray)) and len(first_geom_item) > 0: # Convex or Polygon
+                 geom_repr_list.append(str(np.asarray(first_geom_item)[0].tolist()))
+            elif isinstance(first_geom_item, tuple) and len(first_geom_item) == 2: # Circle (center, radius)
+                 geom_repr_list.append(str(np.asarray(first_geom_item[0]).tolist()) + f"_r{first_geom_item[1]}")
+        geom_repr = "".join(geom_repr_list).replace('[','').replace(']','').replace(',','_').replace(' ','')
+
+        self.const_id = f"wf_boundary_comp_{self.boundtype.value}_{geom_repr}_{id(self)}"[0:100] # Limit length for safety
+        self.const_id = "".join(c if c.isalnum() or c in ['_'] else '_' for c in self.const_id) # Sanitize
+
+
+        # Attributes typically set by XYBoundaryConstraint's __init__ that might be needed by its methods if called by us.
+        # For MultiWF, these are less critical as we override key methods like get_comp, set_design_var_limits, _setup.
+        self.relaxation = False # Default, not typically used at this top level for MultiWF
+        self.boundary_type = self.boundtype.value # For consistency if any XYBC methods were to be used
+
         assert len(geometry) == len(
             wt_groups
         ), "Number of geometries and groups must match"
@@ -1466,26 +1693,162 @@ class MultiWFBoundaryConstraint(XYBoundaryConstraint):
 
     def get_comp(self, n_wt):
         assert n_wt > 0, "Number of turbines must be greater than 0"
-        assert n_wt >= len(
-            self.wt_groups
-        ), "Number of turbines must be greater than or equal to the number of groups"
 
-        if hasattr(self, "boundary_comp"):
-            return self.boundary_comp
+        max_idx_in_groups = -1
+        if self.wt_groups and any(self.wt_groups):
+            all_indices = [idx for group in self.wt_groups for idx in group]
+            if all_indices:
+                max_idx_in_groups = max(all_indices)
 
-        if (comp := self.BD2COMP.get(self.boundtype, None)) is None:
+        assert n_wt > max_idx_in_groups, \
+            f"n_wt ({n_wt}) must be greater than the max turbine index ({max_idx_in_groups}) in wt_groups."
+
+
+        if hasattr(self, "boundary_comp_instance"): # Use a distinct name
+            return self.boundary_comp_instance
+
+        CompClass = self.BD2COMP.get(self.boundtype)
+        if CompClass is None:
             raise NotImplementedError(f"Invalid boundary type {self.boundtype}")
 
-        return comp(
-            n_wt,
-            self.geometry,
-            self.wt_groups,
+        # Pass turbine_diameter to the component's constructor.
+        # The component is responsible for its own internal scaling of geometry.
+        self.boundary_comp_instance = CompClass(
+            n_wt=n_wt,
+            geometry=self.geometry, # Pass original, unscaled geometry
+            wt_groups=self.wt_groups,
             const_id=self.const_id,
             units=self.units,
+            turbine_diameter=self.turbine_diameter # Pass the scaler here
         )
+        return self.boundary_comp_instance
 
     def set_design_var_limits(self, design_vars):
-        _ = design_vars
+        # This method sets limits on design variables (turbine positions)
+        # based on the overall extent of all defined boundaries.
+        # If turbine_diameter is used, turbine positions are in the scaled domain,
+        # so boundary extents must also be scaled before setting limits.
+
+        if not self.geometry: # No geometry to set limits from
+            return
+
+        min_bounds_list = []
+        max_bounds_list = []
+
+        current_geometry = self.geometry # Original, unscaled
+
+        if self.boundtype == BoundaryType.CIRCLE:
+            for center_orig, radius_orig in current_geometry:
+                center = np.asarray(center_orig)
+                radius = radius_orig
+                if self.turbine_diameter is not None and self.turbine_diameter > 0:
+                    center = center / self.turbine_diameter
+                    radius = radius / self.turbine_diameter
+                min_bounds_list.append(center - radius)
+                max_bounds_list.append(center + radius)
+
+        elif self.boundtype in [BoundaryType.CONVEX_HULL, BoundaryType.POLYGON]:
+            for bound_coords_orig in current_geometry:
+                vertices = np.asarray(bound_coords_orig)
+                if self.turbine_diameter is not None and self.turbine_diameter > 0:
+                    vertices = vertices / self.turbine_diameter
+                if vertices.size > 0:
+                    min_bounds_list.append(vertices.min(axis=0))
+                    max_bounds_list.append(vertices.max(axis=0))
+        else:
+            # Fallback or error for unsupported type for design var limits
+            warnings.warn(f"set_design_var_limits not fully implemented for MultiWFBoundaryConstraint type '{self.boundtype}'.")
+            return
+
+        if not min_bounds_list or not max_bounds_list:
+            return # No valid bounds derived
+
+        # Aggregate overall min/max from all geometries
+        overall_min_bounds = np.vstack(min_bounds_list).min(axis=0)
+        overall_max_bounds = np.vstack(max_bounds_list).max(axis=0)
+
+        for k, l, u in zip([topfarm.x_key, topfarm.y_key], overall_min_bounds, overall_max_bounds):
+            if k in design_vars:
+                current_val = design_vars[k][0]
+                current_lower = design_vars[k][1] if len(design_vars[k]) > 1 else -np.inf
+                current_upper = design_vars[k][2] if len(design_vars[k]) > 2 else np.inf
+
+                new_lower = np.maximum(current_lower if current_lower is not None else -np.inf, l)
+                new_upper = np.minimum(current_upper if current_upper is not None else np.inf, u)
+
+                if len(design_vars[k]) == 4: # (val, lower, upper, scaler)
+                    design_vars[k] = (current_val, new_lower, new_upper, design_vars[k][3])
+                elif len(design_vars[k]) == 3: # (val, lower, upper)
+                     design_vars[k] = (current_val, new_lower, new_upper)
+                else:
+                    warnings.warn(f"Design var '{k}' in set_design_var_limits has an unexpected format. Limits applied assuming [val, lower, upper, ...]")
+                    try:
+                        design_vars_list = list(design_vars[k])
+                        design_vars_list[1] = new_lower
+                        design_vars_list[2] = new_upper
+                        design_vars[k] = tuple(design_vars_list)
+                    except Exception as e:
+                        warnings.warn(f"Could not update design_vars for {k}: {e}")
+
+    # Override _setup from XYBoundaryConstraint as MultiWF needs different handling
+    def _setup(self, problem, group='constraint_group'):
+        n_wt = problem.n_wt
+        # self.boundary_comp_instance should be created by get_comp
+        if not hasattr(self, 'boundary_comp_instance') or self.boundary_comp_instance is None:
+            self.boundary_comp_instance = self.get_comp(n_wt) # Calls the overridden get_comp
+
+        self.boundary_comp_instance.problem = problem
+        self.set_design_var_limits(problem.design_vars) # Uses the overridden set_design_var_limits
+
+        representative_boundary_for_problem_output = None
+        # Try to get a representative boundary from the component (which should be scaled if TD is used)
+        if hasattr(self.boundary_comp_instance, 'xy_boundary') and \
+           self.boundary_comp_instance.xy_boundary is not None and \
+           self.boundary_comp_instance.xy_boundary.size > 0:
+            representative_boundary_for_problem_output = self.boundary_comp_instance.xy_boundary
+        elif self.boundtype == BoundaryType.CIRCLE and self.geometry:
+            center1_orig, radius1_orig = self.geometry[0]
+            center1_scaled = np.array(center1_orig)
+            radius1_scaled = radius1_orig
+            if self.turbine_diameter is not None and self.turbine_diameter > 0:
+                center1_scaled = center1_scaled / self.turbine_diameter
+                radius1_scaled = radius1_scaled / self.turbine_diameter
+            t_plot = np.linspace(0, 2 * np.pi, 30)
+            representative_boundary_for_problem_output = center1_scaled + np.array([np.cos(t_plot), np.sin(t_plot)]).T * radius1_scaled
+        elif hasattr(self.boundary_comp_instance, 'xy_boundaries') and self.boundary_comp_instance.xy_boundaries: # MultiConvex
+             rep_bound_obj = self.boundary_comp_instance.xy_boundaries[0]
+             if hasattr(rep_bound_obj, 'vertices') and rep_bound_obj.vertices.size > 0:
+                representative_boundary_for_problem_output = rep_bound_obj.vertices # Already scaled
+        elif hasattr(self.boundary_comp_instance, 'boundaries') and self.boundary_comp_instance.boundaries: # MultiWFPolygon
+             first_boundary_key = list(self.boundary_comp_instance.boundaries.keys())[0]
+             rep_bound_coords = self.boundary_comp_instance.boundaries[first_boundary_key]
+             if rep_bound_coords.size > 0:
+                representative_boundary_for_problem_output = rep_bound_coords # Already scaled
+
+        if representative_boundary_for_problem_output is not None and np.asarray(representative_boundary_for_problem_output).size >0:
+            problem.indeps.add_output('xy_boundary', representative_boundary_for_problem_output)
+        else:
+            warnings.warn(f"Could not determine/use a single representative xy_boundary for problem setup in MultiWFBoundaryConstraint (type: {self.boundtype.value}).")
+
+        comp_subsystem_name = self.const_id # Use the generated const_id for subsystem name
+        getattr(problem.model, group).add_subsystem(comp_subsystem_name, self.boundary_comp_instance, promotes=['*'])
+
+    def setup_as_constraint(self, problem, group='constraint_group'):
+        self._setup(problem, group=group)
+
+        lower_bound = 0
+        if self.boundtype == BoundaryType.CONVEX_HULL:
+            if hasattr(self.boundary_comp_instance, 'zeros'):
+                 lower_bound = self.boundary_comp_instance.zeros
+            else:
+                 warnings.warn("MultiConvexBoundaryComp instance expected to have a 'zeros' attribute for constraint lower bound.")
+        elif problem.n_wt == 1 and self.boundtype != BoundaryType.CONVEX_HULL :
+             lower_bound = 0
+
+        problem.model.add_constraint('boundaryDistances', lower=lower_bound)
+
+    def setup_as_penalty(self, problem, group='constraint_group'):
+        self._setup(problem, group=group)
 
 
 def main():

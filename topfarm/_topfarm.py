@@ -82,7 +82,8 @@ class TopFarmProblem(Problem):
                  constraints=[], plot_comp=NoPlot(), record_id=None,
                  expected_cost=1, ext_vars={}, approx_totals=False,
                  recorder=None, additional_recorders=None,
-                 n_wt=0, grid_layout_comp=None, penalty_comp=None, reports=None, **kwargs):
+                 n_wt=0, grid_layout_comp=None, penalty_comp=None, reports=None,
+                 reference_turbine_diameter=None, scale_aep_by_capacity=True, **kwargs):
         """Initialize TopFarmProblem
 
         Parameters
@@ -167,6 +168,9 @@ class TopFarmProblem(Problem):
 
         self.main_recorder = recorder
         self._additional_recorders = additional_recorders
+        self.reference_turbine_diameter = reference_turbine_diameter
+        self.scale_aep_by_capacity = scale_aep_by_capacity
+
         if not isinstance(constraints, list):
             constraints = [constraints]
         if 'post_constraints' in kwargs:
@@ -189,6 +193,30 @@ class TopFarmProblem(Problem):
                 cost_comp = TopFarmGroup([cost_comp])
             cost_comp.parent = self
         self.cost_comp = cost_comp
+
+        # Determine actual_turbine_diameter_for_constraints
+        actual_turbine_diameter_for_constraints = self.reference_turbine_diameter
+        if actual_turbine_diameter_for_constraints is None and self.cost_comp:
+            # Attempt to import PyWakeAEPCostModelComponent locally to avoid circular import at module level
+            try:
+                from topfarm.cost_models.py_wake_wrapper import PyWakeAEPCostModelComponent
+                pywake_cost_comp_target = None
+                if isinstance(self.cost_comp, PyWakeAEPCostModelComponent):
+                    pywake_cost_comp_target = self.cost_comp
+                elif isinstance(self.cost_comp, TopFarmGroup) and hasattr(self.cost_comp, 'obj_comp') and \
+                     isinstance(self.cost_comp.obj_comp, PyWakeAEPCostModelComponent):
+                    pywake_cost_comp_target = self.cost_comp.obj_comp
+
+                if pywake_cost_comp_target and hasattr(pywake_cost_comp_target, 'windFarmModel') and \
+                   hasattr(pywake_cost_comp_target.windFarmModel, 'windTurbines'):
+                    # Try to get diameter of type 0, assuming it's representative or farm is homogeneous
+                    actual_turbine_diameter_for_constraints = pywake_cost_comp_target.windFarmModel.windTurbines.diameter(type=0)
+            except (ImportError, AttributeError, TypeError, IndexError):
+                # ImportError if PyWake... not found, AttributeError for missing attributes,
+                # TypeError for issues with diameter(), IndexError if type 0 doesn't exist.
+                warnings.warn("Could not automatically infer turbine diameter from PyWakeAEPCostModelComponent. "
+                              "Constraints may not be scaled by diameter if reference_turbine_diameter is not set.")
+                actual_turbine_diameter_for_constraints = None # Ensure it's None if inference fails
 
         if isinstance(driver, list):
             driver = DOEDriver(ListGenerator(driver))
@@ -251,10 +279,14 @@ class TopFarmProblem(Problem):
         if len(constraints) > 0:
             self.model.add_subsystem('constraint_group', ParallelGroup(), promotes=['*'])
             for constr in constraints:
+                setup_kwargs = {}
+                if actual_turbine_diameter_for_constraints is not None:
+                    setup_kwargs['turbine_diameter'] = actual_turbine_diameter_for_constraints
+
                 if constraints_as_penalty:
-                    constr.setup_as_penalty(self)
+                    constr.setup_as_penalty(self, **setup_kwargs)
                 else:
-                    constr.setup_as_constraint(self)
+                    constr.setup_as_constraint(self, **setup_kwargs)
             constraint_violation_comp = ConstraintViolationComponent(constraints)
             self.model.add_subsystem('constraint_violation_comp', constraint_violation_comp, promotes=['*'])
         else:
@@ -276,13 +308,17 @@ class TopFarmProblem(Problem):
 
         if len(post_constraints) > 0:
             if not constraints_as_penalty:
-                for constr in post_constraints:
-                    if isinstance(constr, Constraint):
-                        if 'constraints_group2' not in self.model._subsystems_allprocs:  # and 'post_constraints' not in self.model._static_subsystems_allprocs:
-                            self.model.add_subsystem('constraints_group2', ParallelGroup(), promotes=['*'])
-                        constr.setup_as_constraint(self, group='constraints_group2')
+                for constr in post_constraints: # This loop handles post_constraints
+                    setup_kwargs = {}
+                    if actual_turbine_diameter_for_constraints is not None:
+                        setup_kwargs['turbine_diameter'] = actual_turbine_diameter_for_constraints
 
-                    elif isinstance(constr[-1], dict):
+                    if isinstance(constr, Constraint):
+                        if 'constraints_group2' not in self.model._subsystems_allprocs:
+                            self.model.add_subsystem('constraints_group2', ParallelGroup(), promotes=['*'])
+                        constr.setup_as_constraint(self, group='constraints_group2', **setup_kwargs) # Pass kwargs here too
+
+                    elif isinstance(constr[-1], dict): # This is for [(name, options_dict)] style
                         self.model.add_constraint(str(constr[0]), **constr[-1])
                     else:
                         warnings.warn("""constraint tuples should be of type (keyword, {constraint options}).""",
@@ -299,24 +335,70 @@ class TopFarmProblem(Problem):
         else:
             objective_comp = DummyObjectiveComponent()
         self.model.add_subsystem('objective_comp', objective_comp, promotes=['*'])
-        if cost_comp:
+
+        # AEP scaling and expected_cost logic
+        if self.cost_comp: # Ensure cost_comp exists
+            pywake_cost_comp_target_for_scaling = None
+            # Attempt to import PyWakeAEPCostModelComponent locally
+            try:
+                from topfarm.cost_models.py_wake_wrapper import PyWakeAEPCostModelComponent
+                if isinstance(self.cost_comp, PyWakeAEPCostModelComponent):
+                    pywake_cost_comp_target_for_scaling = self.cost_comp
+                elif isinstance(self.cost_comp, TopFarmGroup) and hasattr(self.cost_comp, 'obj_comp') and \
+                     isinstance(self.cost_comp.obj_comp, PyWakeAEPCostModelComponent):
+                    pywake_cost_comp_target_for_scaling = self.cost_comp.obj_comp
+
+                if pywake_cost_comp_target_for_scaling:
+                    # Set farm_capacity_scaling attribute on the PyWake cost component
+                    pywake_cost_comp_target_for_scaling.farm_capacity_scaling = self.scale_aep_by_capacity
+            except ImportError:
+                 pass # PyWakeAEPCostModelComponent not available, or not the cost model, skip AEP scaling logic
+            except AttributeError:
+                 warnings.warn("Could not set farm_capacity_scaling on cost component. Attribute might be missing.")
+
             if expected_cost is None:
-                expected_cost = self.evaluate()[0]
+                # Temporarily disable AEP scaling for initial cost evaluation if it's active,
+                # as expected_cost should reflect the raw cost magnitude.
+                original_scaling_flag_for_eval = None
+                target_comp_for_eval_flag = pywake_cost_comp_target_for_scaling # Use already identified target
+
+                if target_comp_for_eval_flag and hasattr(target_comp_for_eval_flag, 'farm_capacity_scaling'):
+                    original_scaling_flag_for_eval = target_comp_for_eval_flag.farm_capacity_scaling
+                    target_comp_for_eval_flag.farm_capacity_scaling = False # Get raw AEP for expected_cost
+
+                current_cost_val, _ = self.evaluate() # self.evaluate() returns cost, state
+                expected_cost = current_cost_val
+
+                if target_comp_for_eval_flag and original_scaling_flag_for_eval is not None: # Restore flag
+                    target_comp_for_eval_flag.farm_capacity_scaling = original_scaling_flag_for_eval
+
                 if self._metadata:
-                    self._metadata['setup_status'] = 0
-            if isinstance(driver, EasyDriverBase) and driver.supports_expected_cost is False:
-                expected_cost = 1
-            if isinstance(cost_comp, Group) and approx_totals:
-                cost_comp.approx_totals(**approx_totals)
-            # Use the assembled Jacobian.
-            if 'assembled_jac_type' in self.model.cost_comp.options:
+                    # Reset setup_status because self.evaluate() calls self.setup() and self.final_setup()
+                    # which moves the status to POST_FINAL_SETUP.
+                    # We need it to be lower for subsequent setup/final_setup calls in the normal Problem lifecycle.
+                    self._metadata['setup_status'] = _SetupStatus.PRE_SETUP
+
+            if isinstance(driver, EasyDriverBase) and not driver.supports_expected_cost:
+                expected_cost = 1.0
+            if expected_cost == 0 or not np.isfinite(expected_cost):
+                expected_cost = 1.0 # Avoid division by zero or issues with non-finite cost
+
+            # Apply approx_totals to the cost_comp subsystem added to the model, if it's a Group
+            if hasattr(self.model, 'cost_comp') and isinstance(self.model.cost_comp, Group) and approx_totals:
+                self.model.cost_comp.approx_totals(**approx_totals)
+
+            # Configure assembled Jacobian if applicable
+            if hasattr(self.model, 'cost_comp') and self.model.cost_comp and \
+               hasattr(self.model.cost_comp, 'options') and 'assembled_jac_type' in self.model.cost_comp.options:
                 self.model.cost_comp.options['assembled_jac_type'] = 'dense'
-                self.model.cost_comp.linear_solver.assemble_jac = True
+                if hasattr(self.model.cost_comp, 'linear_solver') and \
+                   hasattr(self.model.cost_comp.linear_solver, 'assemble_jac'):
+                     self.model.cost_comp.linear_solver.assemble_jac = True
+        else: # No cost_comp provided
+            self.indeps.add_output('cost', val=0.0) # Add a dummy cost if none provided
+            expected_cost = 1.0 # Default if no cost component
 
-        else:
-            self.indeps.add_output('cost')
-
-        self.model.add_objective('final_cost', scaler=1 / abs(expected_cost))
+        self.model.add_objective('final_cost', scaler=1.0 / abs(expected_cost))
 
         if plot_comp and not isinstance(plot_comp, NoPlot):
             self.model.add_subsystem('plot_comp', plot_comp, promotes=['*'])
